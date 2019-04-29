@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run BERT on SQuAD."""
+"""Run BERT on QuAC."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -34,6 +34,8 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
+from allennlp.data.fields import Field, TextField, IndexField, \
+    MetadataField, LabelField, ListField, SequenceLabelField
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from pytorch_pretrained_bert.modeling import BertForQuestionAnswering, BertConfig, WEIGHTS_NAME, CONFIG_NAME
 from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
@@ -51,22 +53,28 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
                     level = logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 class SquadExample(object):
     """
     A single training/test example for the Squad dataset.
     For examples without an answer, the start and end position are -1.
     """
-
     def __init__(self,
                  qas_id,
                  question_text,
+                 ## mod start
+                 followup,
+                 yesno,
+                 ## mod stop
                  doc_tokens,
                  orig_answer_text=None,
                  start_position=None,
                  end_position=None,
                  is_impossible=None):
         self.qas_id = qas_id
+        ## mod start
+        self.followup = followup,
+        self.yesno = yesno,
+        ## mod stop
         self.question_text = question_text
         self.doc_tokens = doc_tokens
         self.orig_answer_text = orig_answer_text
@@ -80,8 +88,11 @@ class SquadExample(object):
     def __repr__(self):
         s = ""
         s += "qas_id: %s" % (self.qas_id)
-        s += ", question_text: %s" % (
-            self.question_text)
+        s += ", question_text: %s" % (self.question_text)
+        ## mod start
+        s += ", followup: %s" % (self.followup)
+        s += ", yes: %s" % (self.yesno)
+        ## mod stop
         s += ", doc_tokens: [%s]" % (" ".join(self.doc_tokens))
         if self.start_position:
             s += ", start_position: %d" % (self.start_position)
@@ -90,8 +101,6 @@ class SquadExample(object):
         if self.is_impossible:
             s += ", is_impossible: %r" % (self.is_impossible)
         return s
-
-
 class InputFeatures(object):
     """A single set of features of data."""
 
@@ -107,6 +116,10 @@ class InputFeatures(object):
                  segment_ids,
                  start_position=None,
                  end_position=None,
+                 ## mod start
+                 followup=None,
+                 yesno=None,
+                 ## mod end
                  is_impossible=None):
         self.unique_id = unique_id
         self.example_index = example_index
@@ -119,9 +132,10 @@ class InputFeatures(object):
         self.segment_ids = segment_ids
         self.start_position = start_position
         self.end_position = end_position
+        self.followup = followup
+        self.yesno = followup
         self.is_impossible = is_impossible
-
-
+        
 def read_squad_examples(input_file, is_training, version_2_with_negative):
     """Read a SQuAD json file into a list of SquadExample."""
     with open(input_file, "r", encoding='utf-8') as reader:
@@ -131,6 +145,22 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
         if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
             return True
         return False
+
+    def onehot_foryesno(y):
+        #print("def 1hot yn", y)
+        if y=="x":
+            return 0
+        elif  y=="y":
+            return 1
+        else: return 2
+        
+    def onehot_forfollowup(y):
+        #print("def 1hot fuckup", y)
+        if y=="m":
+            return 0
+        elif  y=="n":
+            return 1
+        else: return 2
 
     examples = []
     for entry in input_data:
@@ -153,6 +183,12 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
             for qa in paragraph["qas"]:
                 qas_id = qa["id"]
                 question_text = qa["question"]
+                ## mod start
+                #followup = qa["followup"]
+                #yesno = qa["yesno"]
+                followup = onehot_forfollowup(qa["followup"])
+                yesno = onehot_foryesno(qa["followup"])
+                ## mod stop
                 start_position = None
                 end_position = None
                 orig_answer_text = None
@@ -160,11 +196,17 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
                 if is_training:
                     if version_2_with_negative:
                         is_impossible = qa["is_impossible"]
+                    ## what is this below thing even doing??!!
+                    '''
                     if (len(qa["answers"]) != 1) and (not is_impossible):
                         raise ValueError(
                             "For training, each question should have exactly 1 answer.")
+                    '''
                     if not is_impossible:
-                        answer = qa["answers"][0]
+                        # squad
+                        #answer = qa["answers"][-1]
+                        # quac
+                        answer = qa["orig_answer"]
                         orig_answer_text = answer["text"]
                         answer_offset = answer["answer_start"]
                         answer_length = len(orig_answer_text)
@@ -187,10 +229,16 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
                         start_position = -1
                         end_position = -1
                         orig_answer_text = ""
-
+                        followup = -1
+                        yesno = -1
+                
                 example = SquadExample(
                     qas_id=qas_id,
                     question_text=question_text,
+                    ## mod start
+                    followup = followup,
+                    yesno = yesno,
+                    ## mod stop
                     doc_tokens=doc_tokens,
                     orig_answer_text=orig_answer_text,
                     start_position=start_position,
@@ -198,7 +246,6 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
                     is_impossible=is_impossible)
                 examples.append(example)
     return examples
-
 
 def convert_examples_to_features(examples, tokenizer, max_seq_length,
                                  doc_stride, max_query_length, is_training):
@@ -225,9 +272,12 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
 
         tok_start_position = None
         tok_end_position = None
+        
         if is_training and example.is_impossible:
             tok_start_position = -1
             tok_end_position = -1
+
+        
         if is_training and not example.is_impossible:
             tok_start_position = orig_to_tok_index[example.start_position]
             if example.end_position < len(example.doc_tokens) - 1:
@@ -343,7 +393,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                     logger.info("end_position: %d" % (end_position))
                     logger.info(
                         "answer: %s" % (answer_text))
-
+                    logger.info("follow up: %d" % (example.followup))
+                    logger.info("Yes or No: %d" % (example.yesno))                  
+                    
             features.append(
                 InputFeatures(
                     unique_id=unique_id,
@@ -357,6 +409,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                     segment_ids=segment_ids,
                     start_position=start_position,
                     end_position=end_position,
+                    followup=example.followup,
+                    yesno=example.yesno,
                     is_impossible=example.is_impossible))
             unique_id += 1
 
@@ -438,7 +492,7 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
 
 
 RawResult = collections.namedtuple("RawResult",
-                                   ["unique_id", "start_logits", "end_logits"])
+                                   ["unique_id", "start_logits", "end_logits", "followup_logits", "yesno_logits"])
 
 
 def write_predictions(all_examples, all_features, all_results, n_best_size,
@@ -964,6 +1018,8 @@ def main():
                 with open(cached_train_features_file, "wb") as writer:
                     pickle.dump(train_features, writer)
         logger.info("***** Running training *****")
+        #logger.info("  Eg0 orig examples = %d", train_examples[0])
+        #logger.info("  Eg0 split examples = %d", train_features[0])
         logger.info("  Num orig examples = %d", len(train_examples))
         logger.info("  Num split examples = %d", len(train_features))
         logger.info("  Batch size = %d", args.train_batch_size)
@@ -973,8 +1029,10 @@ def main():
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
         all_start_positions = torch.tensor([f.start_position for f in train_features], dtype=torch.long)
         all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
-        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                                   all_start_positions, all_end_positions)
+        all_followup_positions = torch.tensor([f.followup for f in train_features], dtype=torch.long)
+        all_yesno_positions = torch.tensor([f.yesno for f in train_features], dtype=torch.long)
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_start_positions, all_end_positions,\
+            all_followup_positions, all_yesno_positions)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -986,8 +1044,9 @@ def main():
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch) # multi-gpu does scattering it-self
-                input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions)
+                input_ids, input_mask, segment_ids, start_positions, end_positions, followup_positions, yesno_positions = batch
+                loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions, followup_positions, yesno_positions)
+                print ('..in run_quac.py.. loss:', loss)
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -1061,15 +1120,19 @@ def main():
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
             with torch.no_grad():
-                batch_start_logits, batch_end_logits = model(input_ids, segment_ids, input_mask)
+                batch_start_logits, batch_end_logits, batch_followup_logits, batch_yesno_logits = model(input_ids, segment_ids, input_mask)
             for i, example_index in enumerate(example_indices):
                 start_logits = batch_start_logits[i].detach().cpu().tolist()
                 end_logits = batch_end_logits[i].detach().cpu().tolist()
+                followup_logits = batch_followup_logits[i].detach().cpu().tolist()
+                yesno_logits = batch_yesno_logits[i].detach().cpu().tolist()
                 eval_feature = eval_features[example_index.item()]
                 unique_id = int(eval_feature.unique_id)
                 all_results.append(RawResult(unique_id=unique_id,
                                              start_logits=start_logits,
-                                             end_logits=end_logits))
+                                             end_logits=end_logits,
+                                             yesno_logits = yesno_logits,
+                                             followup_logits = followup_logits))
         output_prediction_file = os.path.join(args.output_dir, "predictions.json")
         output_nbest_file = os.path.join(args.output_dir, "nbest_predictions.json")
         output_null_log_odds_file = os.path.join(args.output_dir, "null_odds.json")
